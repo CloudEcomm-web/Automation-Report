@@ -2,6 +2,7 @@
   "dependencies": {
     "dotenv": "^17.2.3",
     "googleapis": "^167.0.0",
+    "node-cron": "^4.2.1",
     "puppeteer": "^24.32.0"
   }
 }

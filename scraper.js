@@ -489,15 +489,20 @@ class AnchantoScraper {
    */
   async findExistingFile(drive, filename, folderId) {
     try {
+      // Escape single quotes in filename for the query
+      const escapedFilename = filename.replace(/'/g, "\\'");
+      
       const response = await drive.files.list({
-        q: `name='${filename}' and '${folderId}' in parents and trashed=false`,
-        fields: 'files(id, name, createdTime)',
+        q: `name='${escapedFilename}' and '${folderId}' in parents and trashed=false`,
+        fields: 'files(id, name, createdTime, modifiedTime)',
+        spaces: 'drive',
         supportsAllDrives: true,
         includeItemsFromAllDrives: true,
       });
 
       if (response.data.files && response.data.files.length > 0) {
-        return response.data.files[0]; // Return the first matching file
+        console.log(`  - Found ${response.data.files.length} existing file(s) with name: ${filename}`);
+        return response.data.files; // Return all matching files
       }
       
       return null;
@@ -510,17 +515,42 @@ class AnchantoScraper {
   /**
    * Delete an existing file from Google Drive
    */
-  async deleteFile(drive, fileId) {
+  async deleteFile(drive, fileId, fileName) {
     try {
+      // First, try to get file metadata to check if it's in a Shared Drive
+      const fileMetadata = await drive.files.get({
+        fileId: fileId,
+        fields: 'id, name, driveId',
+        supportsAllDrives: true,
+      }).catch(() => null);
+
+      // Delete the file
       await drive.files.delete({
         fileId: fileId,
         supportsAllDrives: true,
       });
-      console.log(`  ✓ Deleted old file (ID: ${fileId})`);
+      
+      console.log(`  ✓ Deleted old file: ${fileName} (ID: ${fileId})`);
       return true;
     } catch (error) {
-      console.error(`  ✗ Error deleting file: ${error.message}`);
-      return false;
+      console.error(`  ✗ Error deleting file ${fileName}: ${error.message}`);
+      
+      // If deletion fails, try to move to trash instead
+      try {
+        console.log(`  - Attempting to trash file instead...`);
+        await drive.files.update({
+          fileId: fileId,
+          requestBody: {
+            trashed: true,
+          },
+          supportsAllDrives: true,
+        });
+        console.log(`  ✓ Moved file to trash: ${fileName} (ID: ${fileId})`);
+        return true;
+      } catch (trashError) {
+        console.error(`  ✗ Could not trash file either: ${trashError.message}`);
+        return false;
+      }
     }
   }
 
@@ -528,47 +558,60 @@ class AnchantoScraper {
     try {
       console.log('\nUploading to Google Drive...');
       console.log(`  - Target folder ID: ${folderId}`);
+      console.log(`  - Filename: ${filename}`);
       console.log(`  - Replace existing: ${replaceExisting ? 'Yes' : 'No'}`);
 
       // Authenticate with Google Drive API
       const auth = new google.auth.GoogleAuth({
         keyFile: process.env.GOOGLE_SERVICE_ACCOUNT_KEY_FILE,
-        scopes: ['https://www.googleapis.com/auth/drive.file'],
+        scopes: ['https://www.googleapis.com/auth/drive'],
       });
 
       const drive = google.drive({ version: 'v3', auth });
 
-      // Check if file already exists
+      // Check if file already exists and delete if replaceExisting is true
       if (replaceExisting) {
-        console.log(`  - Checking for existing file: ${filename}`);
-        const existingFile = await this.findExistingFile(drive, filename, folderId);
+        console.log(`  - Searching for existing files with name: ${filename}`);
+        const existingFiles = await this.findExistingFile(drive, filename, folderId);
         
-        if (existingFile) {
-          console.log(`  - Found existing file: ${existingFile.name} (created: ${existingFile.createdTime})`);
-          console.log(`  - Deleting old file...`);
-          await this.deleteFile(drive, existingFile.id);
+        if (existingFiles && existingFiles.length > 0) {
+          console.log(`  - Deleting ${existingFiles.length} existing file(s)...`);
+          
+          // Delete all files with the same name
+          for (const file of existingFiles) {
+            await this.deleteFile(drive, file.id, file.name);
+          }
         } else {
-          console.log(`  - No existing file found`);
+          console.log(`  - No existing file found with name: ${filename}`);
         }
       }
 
-      // Upload the file with Shared Drive support
+      // Upload the new file
       console.log(`  - Uploading new file...`);
+      const fileMetadata = {
+        name: filename,
+        parents: [folderId],
+      };
+
+      const media = {
+        mimeType: 'text/csv',
+        body: fs.createReadStream(filename),
+      };
+
       const response = await drive.files.create({
-        requestBody: {
-          name: filename,
-          parents: [folderId],
-        },
-        media: {
-          mimeType: 'text/csv',
-          body: fs.createReadStream(filename),
-        },
+        requestBody: fileMetadata,
+        media: media,
+        fields: 'id, name, webViewLink, createdTime',
         supportsAllDrives: true,
       });
 
       console.log(`✓ File uploaded successfully to Google Drive!`);
       console.log(`  - File ID: ${response.data.id}`);
-      console.log(`  - File Name: ${filename}`);
+      console.log(`  - File Name: ${response.data.name}`);
+      console.log(`  - Created: ${response.data.createdTime}`);
+      if (response.data.webViewLink) {
+        console.log(`  - View Link: ${response.data.webViewLink}`);
+      }
       
       return response.data;
     } catch (error) {
@@ -577,17 +620,21 @@ class AnchantoScraper {
       if (error.message.includes('404') || error.message.includes('not found')) {
         console.error('\n⚠ Folder not found or access denied. Make sure:');
         console.error('  1. The folder/Shared Drive exists');
-        console.error('  2. Service account is added as a member:');
-        console.error('     renz-paragas@decoded-tesla-465608-s9.iam.gserviceaccount.com');
-        console.error('  3. Service account has "Content manager" or "Manager" permissions');
-      } else if (error.message.includes('keyFile')) {
+        console.error('  2. Service account email is added as a member with proper permissions');
+        console.error('  3. Service account has "Content manager" or "Manager" role');
+      } else if (error.message.includes('keyFile') || error.message.includes('ENOENT')) {
         console.error('\n⚠ Service account key file error. Make sure:');
         console.error('  1. GOOGLE_SERVICE_ACCOUNT_KEY_FILE path in .env is correct');
         console.error('  2. The JSON key file exists at that location');
-      } else if (error.message.includes('quota')) {
+        console.error(`  3. Current path: ${process.env.GOOGLE_SERVICE_ACCOUNT_KEY_FILE}`);
+      } else if (error.message.includes('quota') || error.message.includes('storage')) {
         console.error('\n⚠ Storage quota issue detected!');
         console.error('  This error occurs because service accounts have no storage quota.');
         console.error('  Solution: Use a Shared Drive instead of "My Drive"');
+      } else if (error.message.includes('permission')) {
+        console.error('\n⚠ Permission denied. Make sure:');
+        console.error('  1. Service account has been granted access to the folder/Shared Drive');
+        console.error('  2. Service account has write permissions');
       }
       
       throw error;
