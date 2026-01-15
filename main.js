@@ -88,21 +88,21 @@ class ScraperScheduler {
     console.log('\n' + '█'.repeat(80));
     console.log('🚀 ANCHANTO SCRAPER SCHEDULER STARTED');
     console.log('█'.repeat(80));
-    console.log('\n📅 Schedule: Every hour from 6:00 AM to 6:00 AM (24 hours)');
-    console.log('🕐 Runs at: 6:00, 7:00, 8:00, 9:00, 10:00, 11:00, 12:00,');
-    console.log('           13:00, 14:00, 15:00, 16:00, 17:00, 18:00,');
-    console.log('           19:00, 20:00, 21:00, 22:00, 23:00, 0:00,');
-    console.log('           1:00, 2:00, 3:00, 4:00, 5:00, 6:00');
+    console.log('\n📅 Schedule: Every hour at minute 50 (10 minutes before the hour)');
+    console.log('🕐 Runs at: 5:50, 6:50, 7:50, 8:50, 9:50, 10:50, 11:50,');
+    console.log('           12:50, 13:50, 14:50, 15:50, 16:50, 17:50,');
+    console.log('           18:50, 19:50, 20:50, 21:50, 22:50, 23:50, 0:50,');
+    console.log('           1:50, 2:50, 3:50, 4:50');
     console.log('\n⌨️  Press Ctrl+C to stop the scheduler\n');
 
     // Run immediately on start
     console.log('🔄 Running initial scrape...\n');
     this.runScraper();
 
-    // Schedule to run every hour at minute 0
+    // Schedule to run every hour at minute 50 (10 minutes before the hour)
     // Cron format: minute hour day month day-of-week
-    // '0 * * * *' means: at minute 0 of every hour
-    const cronSchedule = '0 * * * *';
+    // '50 * * * *' means: at minute 50 of every hour
+    const cronSchedule = '50 * * * *';
     
     cron.schedule(cronSchedule, () => {
       console.log('\n⏰ Scheduled run triggered!');
@@ -111,7 +111,7 @@ class ScraperScheduler {
       timezone: 'Asia/Manila'
     });
 
-    // Print status every 30 minutes
+    // Print status every 60 minutes
     cron.schedule('*/60 * * * *', () => {
       if (!this.isRunning) {
         this.printStatus();
