@@ -1,465 +1,326 @@
 require('dotenv').config();
-const puppeteer = require('puppeteer');
+const axios = require('axios');
+const tough = require('tough-cookie');
+const { wrapper } = require('axios-cookiejar-support');
+const cheerio = require('cheerio');
 const fs = require('fs');
 const { google } = require('googleapis');
+const { Readable } = require('stream');
 
 class AnchantoScraper {
   constructor() {
-    this.browser = null;
-    this.page = null;
+    this.cookieJar = new tough.CookieJar();
+    this.client = wrapper(axios.create({
+      jar: this.cookieJar,
+      withCredentials: true,
+      timeout: 30000,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.5',
+      }
+    }));
+    this.baseUrl = 'https://ewms.anchanto.com';
+    this.csrfToken = null;
+    this.headers = null;        // Headers for export (excluding Action)
+    this.allHeaders = null;     // All headers including Action
+    this.skipColumnIndexes = new Set(); // Column indexes to skip
   }
 
-  async initialize(headless = false) {
-    console.log('Initializing browser...');
-    this.browser = await puppeteer.launch({
-      headless: headless,
-      args: ['--no-sandbox', '--disable-setuid-sandbox']
-    });
-    this.page = await this.browser.newPage();
-    await this.page.setViewport({ width: 1366, height: 768 });
+  /**
+   * Extract CSRF token from HTML
+   */
+  extractCsrfToken(html) {
+    const $ = cheerio.load(html);
+    return $('meta[name="csrf-token"]').attr('content') || 
+           $('input[name="authenticity_token"]').val();
   }
 
+  /**
+   * Login to Anchanto
+   */
   async login(userEmail, userPassword) {
     console.log('Logging in with email:', userEmail);
     
     try {
-      console.log('Navigating to login page...');
-      await this.page.goto('https://ewms.anchanto.com/login', {
-        waitUntil: 'domcontentloaded',
-        timeout: 30000
+      console.log('Fetching login page...');
+      const loginPageResponse = await this.client.get(`${this.baseUrl}/login`);
+      
+      this.csrfToken = this.extractCsrfToken(loginPageResponse.data);
+      console.log(this.csrfToken ? '✓ CSRF token found' : '⚠ No CSRF token found');
+
+      console.log('Submitting login credentials...');
+      
+      const loginData = new URLSearchParams({
+        'user[email]': userEmail,
+        'user[password]': userPassword,
+        'commit': 'Sign In'
+      });
+      
+      if (this.csrfToken) {
+        loginData.append('authenticity_token', this.csrfToken);
+      }
+
+      await this.client.post(`${this.baseUrl}/login`, loginData.toString(), {
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          'Origin': this.baseUrl,
+          'Referer': `${this.baseUrl}/login`,
+        },
+        maxRedirects: 5,
+        validateStatus: (status) => status < 500
       });
 
-      await new Promise(resolve => setTimeout(resolve, 2000));
-
-      console.log('Page loaded, looking for email input...');
-
-      const emailInput = await this.page.waitForSelector('input#user_email[type="email"]', { 
-        visible: true,
-        timeout: 15000 
+      // Verify login
+      const checkResponse = await this.client.get(`${this.baseUrl}/order_pickup_lists`, {
+        validateStatus: (status) => status < 500
       });
+      
+      if (checkResponse.request?.path?.includes('/login')) {
+        throw new Error('Login failed - invalid credentials');
+      }
 
-      console.log('Email input found!');
+      console.log('✓ Login successful!');
+      return true;
 
-      const passwordInput = await this.page.waitForSelector('input#user_password[type="password"]', { 
-        visible: true,
-        timeout: 15000 
-      });
-
-      console.log('Password input found!');
-
-      await emailInput.click({ clickCount: 3 });
-      await this.page.keyboard.press('Delete');
-      await emailInput.type(userEmail, { delay: 100 });
-
-      await passwordInput.click({ clickCount: 3 });
-      await this.page.keyboard.press('Delete');
-      await passwordInput.type(userPassword, { delay: 100 });
-
-      console.log('Credentials filled, submitting...');
-
-      const submitButton = await this.page.waitForSelector('input[type="submit"][value="Sign In"]', {
-        visible: true,
-        timeout: 10000
-      });
-
-      await Promise.all([
-        this.page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }),
-        submitButton.click()
-      ]);
-
-      console.log('Login successful!');
-      await this.page.screenshot({ path: 'after_login.png' });
     } catch (error) {
       console.error('Login error:', error.message);
-      await this.page.screenshot({ path: 'login_error.png', fullPage: true });
       throw error;
     }
   }
 
-  async setEntriesPerPage(count = 500) {
-    console.log(`Setting entries per page to ${count}...`);
+  /**
+   * Get column headers from HTML page (like old Puppeteer version)
+   */
+  async fetchHeaders() {
+    console.log('Fetching column headers...');
     
-    try {
-      await this.page.waitForSelector('select', { timeout: 10000 });
+    const response = await this.client.get(`${this.baseUrl}/order_pickup_lists?state=unassigned`);
+    const $ = cheerio.load(response.data);
+    
+    const allHeaders = [];
+    const exportHeaders = [];
+    const skipIndexes = new Set();
+    
+    $('table thead th').each((index, el) => {
+      const text = $(el).text().trim();
+      allHeaders.push(text);
       
-      const dropdownChanged = await this.page.evaluate((count) => {
-        const selects = document.querySelectorAll('select');
-        for (let select of selects) {
-          const options = Array.from(select.options).map(opt => opt.value);
-          if (options.includes('10') && options.includes('500')) {
-            select.value = count.toString();
-            select.dispatchEvent(new Event('change', { bubbles: true }));
-            return true;
-          }
-        }
-        return false;
-      }, count);
-
-      if (dropdownChanged) {
-        console.log('Dropdown changed, waiting for table to reload...');
-        
-        await new Promise(resolve => setTimeout(resolve, 1000));
-        
-        await this.page.waitForNetworkIdle({ idleTime: 500, timeout: 10000 }).catch(() => {
-          console.log('Network idle timeout, continuing anyway...');
-        });
-        
-        await this.page.waitForSelector('table tbody tr', { timeout: 15000 });
-        
-        await new Promise(resolve => setTimeout(resolve, 2000));
-        
-        const rowCount = await this.page.evaluate(() => {
-          return document.querySelectorAll('table tbody tr').length;
-        });
-        
-        console.log(`✓ Table reloaded with ${rowCount} visible rows`);
-        console.log(`Successfully set to ${count} entries per page`);
+      // Skip Action/Actions/Select columns (UI-only columns)
+      const lowerText = text.toLowerCase();
+      if (lowerText === 'action' || lowerText === 'actions' || lowerText === 'select' || lowerText === '') {
+        skipIndexes.add(index);
+        console.log(`  - Skipping column ${index}: "${text}" (UI-only)`);
       } else {
-        console.log('Could not find entries per page dropdown');
+        exportHeaders.push(text);
       }
-    } catch (error) {
-      console.error('Error setting entries per page:', error.message);
-    }
-  }
-
-  async getTotalEntries() {
-    try {
-      const totalText = await this.page.evaluate(() => {
-        const elements = document.querySelectorAll('*');
-        for (let el of elements) {
-          const text = el.textContent;
-          if (text && text.includes('Showing') && text.includes('entries')) {
-            return text;
-          }
-        }
-        return null;
-      });
-
-      if (totalText) {
-        const match = totalText.match(/of\s+(\d+)\s+entries/i);
-        if (match) {
-          const total = parseInt(match[1]);
-          console.log(`Total entries found: ${total}`);
-          return total;
-        }
-      }
-      
-      console.log('Could not determine total entries from text');
-      return null;
-    } catch (error) {
-      console.error('Error getting total entries:', error.message);
-      return null;
-    }
-  }
-
-  async scrapeCurrentPage() {
-    console.log('Extracting data from current page...');
-
-    const data = await this.page.evaluate(() => {
-      const table = document.querySelector('table');
-      if (!table) return null;
-
-      const headers = [];
-      const headerCells = table.querySelectorAll('thead th');
-      headerCells.forEach(cell => {
-        headers.push(cell.textContent.trim());
-      });
-
-      const rows = [];
-      const tableRows = table.querySelectorAll('tbody tr');
-      
-      tableRows.forEach(row => {
-        const cells = row.querySelectorAll('td');
-        const rowData = {};
-        
-        cells.forEach((cell, index) => {
-          const header = headers[index] || `Column_${index}`;
-          rowData[header] = cell.textContent.trim();
-        });
-        
-        if (Object.keys(rowData).length > 0) {
-          rows.push(rowData);
-        }
-      });
-
-      return {
-        headers: headers,
-        rows: rows
-      };
     });
-
-    return data;
-  }
-
-  async hasNextPage() {
-    try {
-      const hasNext = await this.page.evaluate(() => {
-        const nextButtons = Array.from(document.querySelectorAll('a, button'));
-        const nextButton = nextButtons.find(btn => 
-          btn.textContent.trim().toLowerCase() === 'next' && 
-          !btn.classList.contains('disabled') &&
-          !btn.hasAttribute('disabled')
-        );
-        return nextButton !== undefined;
-      });
-      
-      return hasNext;
-    } catch (error) {
-      console.error('Error checking for next page:', error.message);
-      return false;
-    }
-  }
-
-  async goToNextPage() {
-    try {
-      console.log('Navigating to next page...');
-      
-      const clicked = await this.page.evaluate(() => {
-        const nextButtons = Array.from(document.querySelectorAll('a, button'));
-        const nextButton = nextButtons.find(btn => 
-          btn.textContent.trim().toLowerCase() === 'next' &&
-          !btn.classList.contains('disabled') &&
-          !btn.hasAttribute('disabled')
-        );
-        
-        if (nextButton) {
-          nextButton.click();
-          return true;
-        }
-        return false;
-      });
-
-      if (clicked) {
-        await new Promise(resolve => setTimeout(resolve, 500));
-        
-        await this.page.waitForNetworkIdle({ idleTime: 500, timeout: 10000 }).catch(() => {
-          console.log('Network idle timeout during navigation, continuing...');
-        });
-        
-        await this.page.waitForSelector('table tbody tr', { timeout: 15000 });
-        
-        await new Promise(resolve => setTimeout(resolve, 1500));
-        
-        const rowCount = await this.page.evaluate(() => {
-          return document.querySelectorAll('table tbody tr').length;
-        });
-        
-        console.log(`✓ Successfully navigated to next page (${rowCount} rows visible)`);
-        return true;
-      } else {
-        console.log('Next button not found or disabled');
-        return false;
-      }
-    } catch (error) {
-      console.error('Error going to next page:', error.message);
-      return false;
-    }
-  }
-
-  getRowIdentifier(row, headers) {
-    const snColumn = headers.find(h => h === 'S/N' || h.toLowerCase().includes('s/n'));
-    const awbColumn = headers.find(h => h === 'AWB' || h.toLowerCase().includes('awb'));
-    const trackingColumn = headers.find(h => h === 'Tracking #' || h.toLowerCase().includes('tracking'));
     
-    if (snColumn && row[snColumn]) {
-      return `sn_${row[snColumn]}`;
-    } else if (awbColumn && row[awbColumn]) {
-      return `awb_${row[awbColumn]}`;
-    } else if (trackingColumn && row[trackingColumn]) {
-      return `tracking_${row[trackingColumn]}`;
-    } else {
-      return Object.values(row).join('|');
-    }
+    this.allHeaders = allHeaders;
+    this.headers = exportHeaders;
+    this.skipColumnIndexes = skipIndexes;
+    
+    console.log(`✓ Found ${allHeaders.length} total columns, exporting ${exportHeaders.length}`);
+    console.log('Export columns:', exportHeaders.join(', '));
+    
+    return exportHeaders;
   }
 
+  /**
+   * Clean HTML from cell values (to match Puppeteer's textContent behavior)
+   */
+  cleanValue(value) {
+    if (value === null || value === undefined) return '';
+    
+    let str = String(value);
+    
+    // Remove all HTML tags
+    str = str.replace(/<[^>]*>/g, ' ');
+    
+    // Decode common HTML entities
+    str = str.replace(/&amp;/g, '&')
+             .replace(/&lt;/g, '<')
+             .replace(/&gt;/g, '>')
+             .replace(/&quot;/g, '"')
+             .replace(/&#39;/g, "'")
+             .replace(/&nbsp;/g, ' ')
+             .replace(/&#(\d+);/g, (match, dec) => String.fromCharCode(dec));
+    
+    // Normalize whitespace (multiple spaces to single, trim)
+    str = str.replace(/\s+/g, ' ').trim();
+    
+    return str;
+  }
+
+  /**
+   * Scrape using DataTables JSON API
+   */
   async scrapeUnassignedPickingLines() {
     console.log('Navigating to unassigned picking lines...');
     
     try {
-      await this.page.goto('https://ewms.anchanto.com/order_pickup_lists?state=unassigned', {
-        waitUntil: 'networkidle2',
-        timeout: 30000
-      });
-
-      console.log('Page loaded, verifying we are on Unassigned tab...');
-      
-      const isCorrectTab = await this.page.evaluate(() => {
-        const tabs = document.querySelectorAll('a, button, div');
-        for (let tab of tabs) {
-          if (tab.textContent.trim() === 'Unassigned' && 
-              (tab.classList.contains('active') || 
-               tab.closest('.active') || 
-               window.location.href.includes('state=unassigned'))) {
-            return true;
-          }
-        }
-        return window.location.href.includes('state=unassigned');
-      });
-
-      if (!isCorrectTab) {
-        console.log('⚠ Warning: May not be on Unassigned tab, but URL contains state=unassigned');
-      } else {
-        console.log('✓ Confirmed on Unassigned tab');
+      // First get headers from HTML page
+      if (!this.headers) {
+        await this.fetchHeaders();
       }
 
-      await this.page.waitForSelector('table', { timeout: 15000 });
-      await this.setEntriesPerPage(500);
-
-      const totalEntries = await this.getTotalEntries();
-      console.log(`Starting to scrape${totalEntries ? ` ${totalEntries} total entries` : ''}...`);
-
       let allRows = [];
-      let allHeaders = null;
+      let offset = 0;
+      const pageSize = 500;
+      let totalRecords = null;
       let pageCount = 0;
-      let hasMore = true;
-      let seenIds = new Set();
-      let duplicateCount = 0;
-      let previousPageRowCount = -1;
 
-      while (hasMore) {
+      console.log(`Starting to scrape with ${pageSize} entries per page...`);
+
+      while (true) {
         pageCount++;
-        console.log(`\nScraping page ${pageCount}...`);
+        console.log(`\nFetching page ${pageCount} (offset: ${offset})...`);
 
-        const currentUrl = this.page.url();
-        if (!currentUrl.includes('state=unassigned')) {
-          console.log('⚠ Warning: URL changed, no longer on unassigned tab!');
-          console.log('Current URL:', currentUrl);
-          console.log('Stopping scraping to prevent collecting wrong data...');
+        // DataTables server-side parameters
+        const params = new URLSearchParams({
+          'state': 'unassigned',
+          'sEcho': pageCount.toString(),
+          'iDisplayStart': offset.toString(),
+          'iDisplayLength': pageSize.toString(),
+        });
+
+        const response = await this.client.get(
+          `${this.baseUrl}/order_pickup_lists.json?${params.toString()}`,
+          {
+            headers: {
+              'Accept': 'application/json',
+              'X-Requested-With': 'XMLHttpRequest',
+            }
+          }
+        );
+
+        const data = response.data;
+
+        // Get total records on first request
+        if (totalRecords === null) {
+          totalRecords = data.iTotalRecords || data.iTotalDisplayRecords || 0;
+          console.log(`Total records: ${totalRecords}`);
+        }
+
+        // aaData contains the rows
+        const rows = data.aaData || [];
+        
+        if (rows.length === 0) {
+          console.log('No more data, stopping...');
           break;
         }
 
-        const pageData = await this.scrapeCurrentPage();
-        
-        if (pageData && pageData.rows.length > 0) {
-          if (!allHeaders) {
-            allHeaders = pageData.headers;
-          }
-          
-          console.log(`Found ${pageData.rows.length} rows on page ${pageCount}`);
-          
-          let newRowsCount = 0;
-          let pageHasDuplicates = false;
-          
-          for (const row of pageData.rows) {
-            const rowId = this.getRowIdentifier(row, allHeaders);
-            
-            if (!seenIds.has(rowId)) {
-              seenIds.add(rowId);
-              allRows.push(row);
-              newRowsCount++;
-            } else {
-              duplicateCount++;
-              pageHasDuplicates = true;
-            }
-          }
-          
-          console.log(`Added ${newRowsCount} new unique rows`);
-          if (pageHasDuplicates) {
-            console.log(`⚠ Found ${pageData.rows.length - newRowsCount} duplicate(s) on this page`);
-          }
-          console.log(`Total unique rows collected: ${allRows.length}`);
+        console.log(`Received ${rows.length} rows`);
 
-          if (newRowsCount === 0 && previousPageRowCount === pageData.rows.length) {
-            console.log('All rows on this page are duplicates and same count as previous page. Stopping...');
-            hasMore = false;
-          } else {
-            previousPageRowCount = pageData.rows.length;
-            
-            hasMore = await this.hasNextPage();
-            
-            if (hasMore) {
-              const success = await this.goToNextPage();
-              if (!success) {
-                console.log('Could not navigate to next page, stopping...');
-                hasMore = false;
+        // Convert array-of-arrays to array-of-objects (matching old format)
+        for (const row of rows) {
+          const rowObj = {};
+          
+          if (Array.isArray(row)) {
+            // Process each cell, skipping Action columns
+            row.forEach((cellValue, colIndex) => {
+              // Skip UI-only columns
+              if (this.skipColumnIndexes.has(colIndex)) {
+                return;
               }
               
-              await new Promise(resolve => setTimeout(resolve, 1000));
-              const urlAfterNav = this.page.url();
-              if (!urlAfterNav.includes('state=unassigned')) {
-                console.log('⚠ Error: Navigation changed the tab! Stopping...');
-                console.log('Expected state=unassigned but got:', urlAfterNav);
-                hasMore = false;
+              const header = this.allHeaders[colIndex];
+              if (header) {
+                rowObj[header] = this.cleanValue(cellValue);
               }
-            } else {
-              console.log('No more pages to scrape');
-            }
+            });
           }
-        } else {
-          console.log('No data found on current page, stopping...');
-          hasMore = false;
+          
+          // Only add row if it has data
+          if (Object.keys(rowObj).length > 0) {
+            allRows.push(rowObj);
+          }
         }
 
-        if (totalEntries && allRows.length > totalEntries * 1.5) {
-          console.log('Warning: Scraped more rows than expected, stopping...');
-          hasMore = false;
+        console.log(`Total collected: ${allRows.length}/${totalRecords}`);
+
+        // Check if done
+        if (allRows.length >= totalRecords) {
+          console.log('All records fetched!');
+          break;
         }
 
+        offset += rows.length;
+
+        // Safety limit
         if (pageCount > 100) {
-          console.log('Warning: Scraped more than 100 pages, stopping to prevent infinite loop...');
-          hasMore = false;
+          console.log('⚠ Reached page limit (100), stopping...');
+          break;
         }
+
+        // Small delay to be respectful to server
+        await new Promise(resolve => setTimeout(resolve, 300));
       }
 
-      console.log(`\n✓ Scraping complete! Total pages: ${pageCount}, Unique rows: ${allRows.length}`);
-      
-      if (duplicateCount > 0) {
-        console.log(`⚠ Total duplicates filtered out: ${duplicateCount}`);
-      }
-
-      if (totalEntries && allRows.length !== totalEntries) {
-        console.log(`⚠ Note: Expected ${totalEntries} entries but got ${allRows.length} unique rows`);
-      }
+      console.log(`\n✓ Scraping complete! Total pages: ${pageCount}, Total rows: ${allRows.length}`);
 
       return {
-        headers: allHeaders,
+        headers: this.headers,
         rows: allRows,
         count: allRows.length,
         totalPages: pageCount,
-        duplicatesRemoved: duplicateCount
+        duplicatesRemoved: 0
       };
 
     } catch (error) {
       console.error('Scraping error:', error.message);
-      await this.page.screenshot({ path: 'scraping_error.png' });
       throw error;
     }
   }
 
+  /**
+   * Main scrape method
+   */
+  async scrape() {
+    return await this.scrapeUnassignedPickingLines();
+  }
+
+  /**
+   * Export to JSON (matching old format)
+   */
   async exportToJSON(data, filename = 'unassigned_picking_lines.json') {
     if (data && data.rows.length > 0) {
       fs.writeFileSync(filename, JSON.stringify(data, null, 2));
       console.log(`✓ Data exported to ${filename}`);
       console.log(`  - Total unique rows: ${data.count}`);
       console.log(`  - Total pages scraped: ${data.totalPages}`);
-      if (data.duplicatesRemoved > 0) {
-        console.log(`  - Duplicates removed: ${data.duplicatesRemoved}`);
-      }
     } else {
       console.log('No data to export');
     }
   }
 
+  /**
+   * Export to CSV (matching old Puppeteer format exactly)
+   */
   async exportToCSV(data, filename = 'unassigned_picking_lines.csv') {
     if (!data || data.rows.length === 0) {
       console.log('No data to export');
       return;
     }
 
+    // Find Order# column index for special formatting
     const orderColumnIndex = data.headers.findIndex(h => 
       h === 'Order#' || 
-      h.toLowerCase().includes('order') && h.includes('#')
+      (h.toLowerCase().includes('order') && h.includes('#'))
     );
 
+    // Build CSV exactly like old version
     const headers = data.headers.join(',');
     const rows = data.rows.map(row => {
       return data.headers.map((header, index) => {
         const value = row[header] || '';
         
+        // Format Order# as text to preserve leading zeros (="value")
         if (index === orderColumnIndex && value) {
           return `="${value.replace(/"/g, '""')}"`;
         }
         
+        // Standard CSV quoting
         return `"${value.replace(/"/g, '""')}"`;
       }).join(',');
     });
@@ -470,16 +331,36 @@ class AnchantoScraper {
     console.log(`✓ Data exported to ${filename}`);
     console.log(`  - Total unique rows: ${data.count}`);
     console.log(`  - Total pages scraped: ${data.totalPages}`);
-    if (data.duplicatesRemoved > 0) {
-      console.log(`  - Duplicates removed: ${data.duplicatesRemoved}`);
-    }
     console.log(`  - Order# column formatted as text`);
   }
 
+  /**
+   * Convert data to CSV stream for Google Drive upload
+   */
+  csvToStream(data) {
+    const orderColumnIndex = data.headers.findIndex(h => 
+      h === 'Order#' || (h.toLowerCase().includes('order') && h.includes('#'))
+    );
+
+    const headers = data.headers.join(',');
+    const rows = data.rows.map(row => {
+      return data.headers.map((header, index) => {
+        const value = row[header] || '';
+        if (index === orderColumnIndex && value) {
+          return `="${value.replace(/"/g, '""')}"`;
+        }
+        return `"${value.replace(/"/g, '""')}"`;
+      }).join(',');
+    });
+
+    const csv = [headers, ...rows].join('\n');
+    return Readable.from([csv]);
+  }
+
+  /**
+   * Extract folder ID from Google Drive link
+   */
   extractFolderIdFromLink(link) {
-    // Extract folder ID from various Google Drive link formats
-    // Format 1: https://drive.google.com/drive/folders/FOLDER_ID
-    // Format 2: https://drive.google.com/drive/u/0/folders/FOLDER_ID
     const match = link.match(/folders\/([a-zA-Z0-9_-]+)/);
     return match ? match[1] : null;
   }
@@ -489,7 +370,6 @@ class AnchantoScraper {
    */
   async findExistingFile(drive, filename, folderId) {
     try {
-      // Escape single quotes in filename for the query
       const escapedFilename = filename.replace(/'/g, "\\'");
       
       const response = await drive.files.list({
@@ -502,7 +382,7 @@ class AnchantoScraper {
 
       if (response.data.files && response.data.files.length > 0) {
         console.log(`  - Found ${response.data.files.length} existing file(s) with name: ${filename}`);
-        return response.data.files; // Return all matching files
+        return response.data.files;
       }
       
       return null;
@@ -517,14 +397,6 @@ class AnchantoScraper {
    */
   async deleteFile(drive, fileId, fileName) {
     try {
-      // First, try to get file metadata to check if it's in a Shared Drive
-      const fileMetadata = await drive.files.get({
-        fileId: fileId,
-        fields: 'id, name, driveId',
-        supportsAllDrives: true,
-      }).catch(() => null);
-
-      // Delete the file
       await drive.files.delete({
         fileId: fileId,
         supportsAllDrives: true,
@@ -535,14 +407,12 @@ class AnchantoScraper {
     } catch (error) {
       console.error(`  ✗ Error deleting file ${fileName}: ${error.message}`);
       
-      // If deletion fails, try to move to trash instead
+      // Try to trash instead
       try {
         console.log(`  - Attempting to trash file instead...`);
         await drive.files.update({
           fileId: fileId,
-          requestBody: {
-            trashed: true,
-          },
+          requestBody: { trashed: true },
           supportsAllDrives: true,
         });
         console.log(`  ✓ Moved file to trash: ${fileName} (ID: ${fileId})`);
@@ -554,7 +424,10 @@ class AnchantoScraper {
     }
   }
 
-  async uploadToGoogleDrive(filename, folderId, replaceExisting = true) {
+  /**
+   * Upload to Google Drive
+   */
+  async uploadToGoogleDrive(data, filename, folderId, replaceExisting = true) {
     try {
       console.log('\nUploading to Google Drive...');
       console.log(`  - Target folder ID: ${folderId}`);
@@ -562,22 +435,32 @@ class AnchantoScraper {
       console.log(`  - Replace existing: ${replaceExisting ? 'Yes' : 'No'}`);
 
       // Authenticate with Google Drive API
-      const auth = new google.auth.GoogleAuth({
-        keyFile: process.env.GOOGLE_SERVICE_ACCOUNT_KEY_FILE,
-        scopes: ['https://www.googleapis.com/auth/drive'],
-      });
+      let auth;
+      
+      if (process.env.GOOGLE_SERVICE_ACCOUNT_KEY_FILE) {
+        auth = new google.auth.GoogleAuth({
+          keyFile: process.env.GOOGLE_SERVICE_ACCOUNT_KEY_FILE,
+          scopes: ['https://www.googleapis.com/auth/drive'],
+        });
+      } else if (process.env.GOOGLE_SERVICE_ACCOUNT_KEY) {
+        const credentials = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_KEY);
+        auth = new google.auth.GoogleAuth({
+          credentials,
+          scopes: ['https://www.googleapis.com/auth/drive'],
+        });
+      } else {
+        throw new Error('No Google credentials configured');
+      }
 
       const drive = google.drive({ version: 'v3', auth });
 
-      // Check if file already exists and delete if replaceExisting is true
+      // Delete existing file if needed
       if (replaceExisting) {
         console.log(`  - Searching for existing files with name: ${filename}`);
         const existingFiles = await this.findExistingFile(drive, filename, folderId);
         
         if (existingFiles && existingFiles.length > 0) {
           console.log(`  - Deleting ${existingFiles.length} existing file(s)...`);
-          
-          // Delete all files with the same name
           for (const file of existingFiles) {
             await this.deleteFile(drive, file.id, file.name);
           }
@@ -595,7 +478,7 @@ class AnchantoScraper {
 
       const media = {
         mimeType: 'text/csv',
-        body: fs.createReadStream(filename),
+        body: this.csvToStream(data),
       };
 
       const response = await drive.files.create({
@@ -618,33 +501,14 @@ class AnchantoScraper {
       console.error('Error uploading to Google Drive:', error.message);
       
       if (error.message.includes('404') || error.message.includes('not found')) {
-        console.error('\n⚠ Folder not found or access denied. Make sure:');
-        console.error('  1. The folder/Shared Drive exists');
-        console.error('  2. Service account email is added as a member with proper permissions');
-        console.error('  3. Service account has "Content manager" or "Manager" role');
+        console.error('\n⚠ Folder not found or access denied.');
       } else if (error.message.includes('keyFile') || error.message.includes('ENOENT')) {
-        console.error('\n⚠ Service account key file error. Make sure:');
-        console.error('  1. GOOGLE_SERVICE_ACCOUNT_KEY_FILE path in .env is correct');
-        console.error('  2. The JSON key file exists at that location');
-        console.error(`  3. Current path: ${process.env.GOOGLE_SERVICE_ACCOUNT_KEY_FILE}`);
+        console.error('\n⚠ Service account key file error.');
       } else if (error.message.includes('quota') || error.message.includes('storage')) {
-        console.error('\n⚠ Storage quota issue detected!');
-        console.error('  This error occurs because service accounts have no storage quota.');
-        console.error('  Solution: Use a Shared Drive instead of "My Drive"');
-      } else if (error.message.includes('permission')) {
-        console.error('\n⚠ Permission denied. Make sure:');
-        console.error('  1. Service account has been granted access to the folder/Shared Drive');
-        console.error('  2. Service account has write permissions');
+        console.error('\n⚠ Storage quota issue - use a Shared Drive instead.');
       }
       
       throw error;
-    }
-  }
-
-  async close() {
-    if (this.browser) {
-      await this.browser.close();
-      console.log('Browser closed');
     }
   }
 }
@@ -654,39 +518,31 @@ async function main() {
   const scraper = new AnchantoScraper();
 
   try {
-    // Initialize browser (set to true for headless mode)
-    await scraper.initialize(false);
-
-    // Load credentials from environment variables
     const myEmail = process.env.ANCHANTO_EMAIL;
     const myPassword = process.env.ANCHANTO_PASSWORD;
     const gdriveFolderLink = process.env.GDRIVE_FOLDER_LINK;
 
-    // Validate credentials
     if (!myEmail || !myPassword) {
       throw new Error('Missing credentials! Please set ANCHANTO_EMAIL and ANCHANTO_PASSWORD in your .env file');
     }
 
     console.log('='.repeat(60));
-    console.log('ANCHANTO SCRAPER - Enhanced with Pagination Support');
+    console.log('ANCHANTO SCRAPER - HTTP Version (No Puppeteer)');
     console.log('='.repeat(60));
 
     // Login
     await scraper.login(myEmail, myPassword);
 
-    // Scrape ALL unassigned picking lines with pagination
-    const data = await scraper.scrapeUnassignedPickingLines();
+    // Scrape ALL unassigned picking lines
+    const data = await scraper.scrape();
 
-    if (data) {
+    if (data && data.rows.length > 0) {
       console.log('\n' + '='.repeat(60));
       console.log('SCRAPING SUMMARY');
       console.log('='.repeat(60));
       console.log('Headers:', data.headers.join(', '));
       console.log('Total rows scraped:', data.count);
       console.log('Total pages processed:', data.totalPages);
-      if (data.duplicatesRemoved > 0) {
-        console.log('Duplicates removed:', data.duplicatesRemoved);
-      }
       console.log('\nFirst row sample:');
       console.log(JSON.stringify(data.rows[0], null, 2));
 
@@ -698,14 +554,13 @@ async function main() {
       console.log('\n✓ All data successfully exported!');
 
       // Upload to Google Drive if configured
-      if (gdriveFolderLink && process.env.GOOGLE_SERVICE_ACCOUNT_KEY_FILE) {
+      if (gdriveFolderLink && (process.env.GOOGLE_SERVICE_ACCOUNT_KEY_FILE || process.env.GOOGLE_SERVICE_ACCOUNT_KEY)) {
         const folderId = scraper.extractFolderIdFromLink(gdriveFolderLink);
         if (folderId) {
           console.log('\n' + '='.repeat(60));
           console.log('GOOGLE DRIVE UPLOAD');
           console.log('='.repeat(60));
-          // Upload with file replacement enabled (true by default)
-          await scraper.uploadToGoogleDrive(csvFilename, folderId, true);
+          await scraper.uploadToGoogleDrive(data, csvFilename, folderId, true);
         } else {
           console.log('\n⚠ Could not extract folder ID from Google Drive link');
           console.log('   Link format should be: https://drive.google.com/drive/folders/FOLDER_ID');
@@ -715,19 +570,25 @@ async function main() {
         if (!gdriveFolderLink) {
           console.log('  - Set GDRIVE_FOLDER_LINK in .env to enable upload');
         }
-        if (!process.env.GOOGLE_SERVICE_ACCOUNT_KEY_FILE) {
+        if (!process.env.GOOGLE_SERVICE_ACCOUNT_KEY_FILE && !process.env.GOOGLE_SERVICE_ACCOUNT_KEY) {
           console.log('  - Set GOOGLE_SERVICE_ACCOUNT_KEY_FILE in .env to enable upload');
         }
       }
+    } else {
+      console.log('\n⚠ No data was scraped');
     }
 
   } catch (error) {
     console.error('\n✗ Error:', error.message);
     console.error(error.stack);
-  } finally {
-    await scraper.close();
+    process.exit(1);
   }
 }
 
-// Run the scraper
-main();
+// Export for module use (Vercel, etc.)
+module.exports = { AnchantoScraper };
+
+// Run if executed directly
+if (require.main === module) {
+  main();
+}

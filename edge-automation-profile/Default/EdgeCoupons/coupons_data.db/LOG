@@ -1,0 +1,11 @@
+2026/01/06-18:00:35.903 824 Reusing MANIFEST C:\Users\Acer\OneDrive\Documents\entry\scripting\edge-automation-profile\Default\EdgeCoupons/coupons_data.db/MANIFEST-000001
+2026/01/06-18:00:35.904 824 Recovering log #15
+2026/01/06-18:00:35.908 824 Level-0 table #18: started
+2026/01/06-18:00:35.927 824 Level-0 table #18: 681368 bytes OK
+2026/01/06-18:00:35.928 824 Recovering log #18
+2026/01/06-18:00:35.929 824 Reusing old log C:\Users\Acer\OneDrive\Documents\entry\scripting\edge-automation-profile\Default\EdgeCoupons/coupons_data.db/000018.log 
+2026/01/06-18:00:35.931 824 Delete type=0 #15
+2026/01/06-18:00:35.931 824 Delete type=2 #19
+2026/01/06-18:00:35.995 df94 Level-0 table #20: started
+2026/01/06-18:00:36.000 df94 Level-0 table #20: 681368 bytes OK
+2026/01/06-18:00:36.002 df94 Delete type=0 #18

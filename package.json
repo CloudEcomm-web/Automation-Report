@@ -1,8 +1,24 @@
 {
+  "name": "anchanto-scraper",
+  "version": "2.0.0",
+  "description": "Anchanto scraper using HTTP requests (no Puppeteer)",
+  "main": "scraper.js",
+  "scripts": {
+    "start": "node scraper.js",
+    "scrape": "node scraper.js"
+  },
   "dependencies": {
+    "axios": "^1.13.2",
+    "axios-cookiejar-support": "^6.0.5",
+    "cheerio": "^1.1.2",
     "dotenv": "^17.2.3",
     "googleapis": "^167.0.0",
     "node-cron": "^4.2.1",
-    "puppeteer": "^24.32.0"
+    "playwright": "^1.57.0",
+    "puppeteer": "^24.34.0",
+    "tough-cookie": "^6.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   }
 }
