@@ -366,6 +366,64 @@ class AnchantoScraper {
   }
 
   /**
+   * Trigger Google Apps Script webhook
+   */
+  async triggerGoogleScript(data = {}) {
+    const scriptUrl = process.env.GOOGLE_SCRIPT_URL;
+    
+    if (!scriptUrl) {
+      console.log('⚠ Google Script URL not configured, skipping trigger');
+      return null;
+    }
+
+    try {
+      console.log('\nTriggering Google Apps Script...');
+      console.log(`  - URL: ${scriptUrl.substring(0, 50)}...`);
+      
+      // Send POST request with data
+      const response = await axios.post(scriptUrl, {
+        action: 'scrapeComplete',
+        timestamp: new Date().toISOString(),
+        rowCount: data.rowCount || 0,
+        source: 'anchanto-scraper',
+        ...data
+      }, {
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        timeout: 30000,
+        maxRedirects: 5,
+      });
+
+      console.log('✓ Google Script triggered successfully!');
+      console.log(`  - Response: ${JSON.stringify(response.data).substring(0, 100)}`);
+      
+      return response.data;
+    } catch (error) {
+      // Google Scripts often redirect, try GET as fallback
+      try {
+        console.log('  - POST failed, trying GET request...');
+        const params = new URLSearchParams({
+          action: 'scrapeComplete',
+          timestamp: new Date().toISOString(),
+          rowCount: data.rowCount || 0,
+        });
+        
+        const response = await axios.get(`${scriptUrl}?${params.toString()}`, {
+          timeout: 30000,
+          maxRedirects: 5,
+        });
+        
+        console.log('✓ Google Script triggered successfully (GET)!');
+        return response.data;
+      } catch (getError) {
+        console.error('⚠ Error triggering Google Script:', error.message);
+        return null;
+      }
+    }
+  }
+
+  /**
    * Search for existing file with the same name in the folder
    */
   async findExistingFile(drive, filename, folderId) {
@@ -573,6 +631,18 @@ async function main() {
         if (!process.env.GOOGLE_SERVICE_ACCOUNT_KEY_FILE && !process.env.GOOGLE_SERVICE_ACCOUNT_KEY) {
           console.log('  - Set GOOGLE_SERVICE_ACCOUNT_KEY_FILE in .env to enable upload');
         }
+      }
+
+      // Trigger Google Apps Script if configured
+      if (process.env.GOOGLE_SCRIPT_URL) {
+        console.log('\n' + '='.repeat(60));
+        console.log('GOOGLE APPS SCRIPT TRIGGER');
+        console.log('='.repeat(60));
+        await scraper.triggerGoogleScript({
+          rowCount: data.count,
+          pagesScraped: data.totalPages,
+          headers: data.headers,
+        });
       }
     } else {
       console.log('\n⚠ No data was scraped');
